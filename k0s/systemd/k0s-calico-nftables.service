@@ -1,0 +1,32 @@
+# =============================================================================
+# systemd 单元 — 开机后自动重应用 Calico nftables 放行规则
+# =============================================================================
+# nft 规则只存在于内存, 节点重启后丢失。Calico 在开机后会重建自己的 nft 表,
+# 但不会重建我们额外加的 pod 网段/cali 接口放行规则, 导致重启后跨节点 pod
+# 通信和 pod→Service 流量再次被 DROP。本单元在 k0s 启动后调用脚本重应用。
+#
+# 安装(由 apply-calico-fixes.sh 自动完成, 也可手动):
+#   sudo install -m 0755 k0s/scripts/apply-nftables-rules.sh /usr/local/sbin/
+#   sudo install -m 0644 k0s/systemd/k0s-calico-nftables.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable k0s-calico-nftables.service
+#
+# 脚本内部会等待 Calico 的 nft 表出现再插规则, 因此 After= 顺序要求不严;
+# 设为 k0s.service/kubelet 之后启动可减少等待。
+# =============================================================================
+[Unit]
+Description=Apply Calico nftables allow-rules for Tailscale overlay (k0s)
+After=network-online.target k0s.service kubelet.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/apply-nftables-rules.sh
+Environment=POD_CIDR=10.244.0.0/16
+# 重试: 首次开机若 Calico 晚起, 规则可能没插上, 稍后再跑一次
+RemainAfterExit=yes
+Restart=on-failure
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target

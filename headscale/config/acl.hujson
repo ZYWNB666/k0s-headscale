@@ -1,0 +1,9 @@
+// Headscale ACL 策略 — 异地组网访问控制
+// 文档: https://tailscale.com/docs/features/access-control/acls
+// 语法: HuJSON (支持注释和尾逗号)
+//
+// 当前阶段: 联调全通策略(所有节点互通, 含任意端口)。
+// Headscale 约定: 省略 acls/grants 段即默认 allow-all。
+// 验证 P2P 直连通过后, 可切换为 acl-detailed.hujson 的"细化策略模板"。
+{
+}

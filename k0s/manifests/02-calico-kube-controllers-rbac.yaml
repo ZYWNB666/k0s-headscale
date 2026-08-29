@@ -1,0 +1,83 @@
+# =============================================================================
+# calico-kube-controllers ClusterRole — 完整权限(替换 k0s 默认的不完整版本)
+# =============================================================================
+# 问题: k0s v1.36 的 Calico chart 模板(v3.32)与镜像(v3.29.3)版本不匹配。
+# 模板的 namespace controller 需要 list serviceaccounts, networking.k8s.io/
+# networkpolicies 等资源,但 k0s 打包的 ClusterRole(来自旧版本)缺少这些权限,
+# 导致 calico-kube-controllers 反复报 "connection is unauthorized: serviceaccounts
+# is forbidden" 并 FATAL 退出。
+#
+# 修复: 用这份完整 ClusterRole 覆盖默认的。apply 是声明式的,可重复执行;
+# 集群级资源,创建后持久存在于 etcd/kine,节点重启不丢。
+#
+# 应用方式: 由 k0s/scripts/apply-calico-fixes.sh 自动 apply。
+# =============================================================================
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: calico-kube-controllers
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["watch", "list", "get"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["services", "services/status"]
+    verbs: ["get", "list", "update", "watch"]
+  # ↓ k0s 默认 ClusterRole 缺失,补全(问题16)
+  - apiGroups: [""]
+    resources: ["serviceaccounts"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["projectcalico.org", "crd.projectcalico.org"]
+    resources: ["ipreservations"]
+    verbs: ["list"]
+  - apiGroups: ["projectcalico.org", "crd.projectcalico.org"]
+    resources: ["blockaffinities", "ipamblocks", "ipamhandles", "ipamconfigurations", "ipamconfigs", "tiers"]
+    verbs: ["get", "list", "create", "update", "delete", "watch"]
+  - apiGroups: ["projectcalico.org", "crd.projectcalico.org"]
+    resources: ["ippools"]
+    verbs: ["list", "watch"]
+  - apiGroups: ["projectcalico.org", "crd.projectcalico.org"]
+    resources: ["hostendpoints"]
+    verbs: ["get", "list", "create", "update", "delete", "watch"]
+  - apiGroups: ["projectcalico.org", "crd.projectcalico.org"]
+    resources: ["clusterinformations"]
+    verbs: ["get", "list", "create", "update", "watch"]
+  - apiGroups: ["projectcalico.org", "crd.projectcalico.org"]
+    resources: ["kubecontrollersconfigurations"]
+    verbs: ["get", "list", "create", "update", "watch"]
+  - apiGroups: ["projectcalico.org", "crd.projectcalico.org"]
+    resources: ["kubecontrollersconfigurations/status"]
+    verbs: ["get", "update"]
+  - apiGroups: ["projectcalico.org", "crd.projectcalico.org"]
+    resources: ["networkpolicies", "stagednetworkpolicies", "globalnetworkpolicies", "stagedglobalnetworkpolicies"]
+    verbs: ["watch", "list", "get", "create", "update", "delete"]
+  - apiGroups: ["apps"]
+    resources: ["daemonsets", "deployments"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["migration.projectcalico.org"]
+    resources: ["datastoremigrations", "datastoremigrations/status"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: ["apiextensions.k8s.io"]
+    resources: ["customresourcedefinitions"]
+    verbs: ["get", "list", "watch", "delete"]
+  - apiGroups: ["apiregistration.k8s.io"]
+    resources: ["apiservices"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: ["projectcalico.org"]
+    resources: ["*"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["crd.projectcalico.org"]
+    resources: ["*"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["kubevirt.io"]
+    resources: ["virtualmachines", "virtualmachineinstances"]
+    verbs: ["get", "list", "watch"]

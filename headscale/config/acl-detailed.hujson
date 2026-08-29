@@ -1,0 +1,58 @@
+// ============================================================
+// Headscale 细化 ACL 策略模板(验证 P2P 直连通过后启用)
+// ============================================================
+// 启用方法:
+//   1. 用本文件内容覆盖 ./config/acl.hujson
+//   2. docker exec headscale kill -HUP 1        (热重载, 无需重启)
+//   3. docker exec headscale headscale nodes list  (确认策略生效)
+//
+// 标签规划:
+//   tag:server  — 服务器节点(被访问方, 如机房主机、NAS)
+//   tag:client  — 客户端节点(访问方, 如办公电脑、手机)
+//   tag:admin   — 管理节点(全权限)
+//
+// 打标签方法(节点接入时):
+//   sudo tailscale up --login-server ... --advertise-tags tag:server
+//   (首次使用某 tag 需在 tagOwners 中声明 owner, 见下)
+// ============================================================
+{
+  // 标签归属: 谁可以为节点打该标签
+  // 用 headscale users list 查到的用户, "*" 表示任意已认证用户
+  "tagOwners": {
+    "tag:server": ["*"],
+    "tag:client": ["*"],
+    "tag:admin":  ["*"],
+  },
+
+  // 访问策略
+  "acls": [
+    // 1. 管理员节点 → 全 tailnet
+    {
+      "action": "accept",
+      "src": ["tag:admin"],
+      "dst": ["*:*"],
+    },
+    // 2. 客户端 → 服务器和客户端(协作互通)
+    {
+      "action": "accept",
+      "src": ["tag:client"],
+      "dst": ["tag:client:*", "tag:server:*"],
+    },
+    // 3. 服务器之间互通(机房互联)
+    {
+      "action": "accept",
+      "src": ["tag:server"],
+      "dst": ["tag:server:*"],
+    },
+  ],
+
+  // 可选: Tailscale SSH(节点间免密 SSH, 需客户端开启 --ssh)
+  "ssh": [
+    {
+      "action": "accept",
+      "src": ["tag:admin"],
+      "dst": ["tag:server"],
+      "users": ["root", "ubuntu"],
+    },
+  ],
+}

@@ -1,0 +1,40 @@
+# =============================================================================
+# Headscale 异地组网控制面 — host network 模式
+# 架构: Caddy(TLS 终结, :3477/tcp) + Headscale(plain HTTP :8080, gRPC :50443,
+#        STUN :3478/udp, 内嵌 DERP)
+# host network: 容器直接用宿主机网络栈,不经 docker-proxy,STUN/DERP 打洞更可靠。
+#
+# 部署: 见 headscale/README.md
+# =============================================================================
+services:
+  headscale:
+    image: ${HEADSCALE_IMAGE:-headscale/headscale:v0.29.3}
+    container_name: headscale
+    restart: unless-stopped
+    command: serve
+    network_mode: host
+    volumes:
+      - ./config/config.yaml:/etc/headscale/config.yaml:ro
+      - ./config/acl.hujson:/etc/headscale/acl.hujson:ro
+      - ./data:/var/lib/headscale
+    # noise_private.key / derp_server_private.key 首次启动自动生成于 ./data/
+    healthcheck:
+      test: ["CMD", "headscale", "health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  caddy:
+    image: caddy:2
+    container_name: headscale-caddy
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./certs:/etc/caddy/certs:ro
+      - ./ui:/etc/caddy/ui:ro
+      - ./caddy/data:/data
+      - ./caddy/config:/config
+    depends_on:
+      - headscale
