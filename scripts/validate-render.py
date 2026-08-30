@@ -86,7 +86,14 @@ def build_k0sctl(env, kine_ds='', registry=''):
         lines.append(f"            - printf '[Service]\\\\nEnvironment=POD_CIDR={env['K0S_POD_CIDR']}\\\\n' > /etc/systemd/system/k0s-calico-nftables.service.d/override.conf")
         lines.append("            - systemctl daemon-reload")
         lines.append("            - systemctl enable k0s-calico-nftables.service")
-        lines.append(f"            - POD_CIDR={env['K0S_POD_CIDR']} /usr/local/sbin/apply-nftables-rules.sh >/dev/null 2>&1 || true")
+        lines.append(f"            - POD_CIDR={env['K0S_POD_CIDR']} WAIT_SECS=180 /usr/local/sbin/apply-nftables-rules.sh >/dev/null 2>&1 || true")
+        if is_controller:
+            cip = env['K0S_CONTROLLER_IP']
+            lines.append(f"            - for i in $(seq 1 60); do k0s kubectl set env ds -n kube-system calico-node KUBERNETES_SERVICE_HOST={cip} KUBERNETES_SERVICE_PORT=6443 >/dev/null 2>&1 && break; sleep 5; done")
+            lines.append(f"            - for i in $(seq 1 60); do k0s kubectl set env deploy -n kube-system calico-kube-controllers KUBERNETES_SERVICE_HOST={cip} KUBERNETES_SERVICE_PORT=6443 >/dev/null 2>&1 && break; sleep 5; done")
+            lines.append("            - k0s kubectl wait pod -n kube-system --all --for=condition=Ready --timeout=240s >/dev/null 2>&1 || true")
+            lines.append("            - R=$(k0s kubectl get pods -n kube-system --no-headers 2>/dev/null | awk '{split($2,a,\"/\"); if ($2!=\"Completed\" && a[1]!=a[2]) c++} END{print c+0}'); if [ \"$R\" != \"0\" ]; then k0s kubectl delete pod -n kube-system -l k8s-app=calico-node --ignore-not-found >/dev/null 2>&1 || true; k0s kubectl delete pod -n kube-system -l k8s-app=konnectivity-agent --ignore-not-found >/dev/null 2>&1 || true; fi")
+            lines.append("            - k0s kubectl wait pod -n kube-system --all --for=condition=Ready --timeout=180s >/dev/null 2>&1 || true")
         is_controller = False
     lines.append("  k0s:")
     lines.append(f"    version: {env['K0S_VERSION']}")
@@ -192,13 +199,20 @@ def check_k0sctl(env, kine_ds, registry, label):
     chk(len(wrk_files) == 2, f"worker files 数量=2 (脚本 + 单元), 实际={len(wrk_files)}")
     wrk_dsts = {f.get('dstDir') for f in wrk_files}
     chk('/var/lib/k0s/manifests' not in str(wrk_dsts), "worker 不含 manifest(只在 controller)")
-    # hooks.after: systemd 启用 + nft 首次应用 (不再有 loadbalancer 禁用, v3.32.1 支持)
+    # hooks.after: systemd 启用 + nft 首次应用 + KUBERNETES_SERVICE_HOST 注入 + 收敛自愈
     ctrl_after = hosts[0]['hooks']['apply']['after']
     chk(any('systemctl enable k0s-calico-nftables' in c for c in ctrl_after), "controller hook after 含 systemd enable")
-    chk(any('apply-nftables-rules.sh' in c for c in ctrl_after), "controller hook after 含 nft 首次应用")
+    chk(any('WAIT_SECS=180' in c and 'apply-nftables-rules.sh' in c for c in ctrl_after), "controller hook after 含 nft 脚本(180s 等待)")
     chk(all('ENABLED_CONTROLLERS' not in c for c in ctrl_after), "controller hook after 不含 loadbalancer 禁用(v3.32.1 支持)")
+    chk(any('set env ds -n kube-system calico-node KUBERNETES_SERVICE_HOST' in c and 'for i in' in c
+            for c in ctrl_after), "controller hook 含 calico-node API 直连注入(带重试)")
+    chk(any('set env deploy -n kube-system calico-kube-controllers KUBERNETES_SERVICE_HOST' in c
+            for c in ctrl_after), "controller hook 含 kube-controllers API 直连注入")
+    chk(any('--for=condition=Ready' in c for c in ctrl_after), "controller hook 含 Ready 收敛等待")
+    chk(any('delete pod' in c and 'konnectivity-agent' in c for c in ctrl_after), "controller hook 含 agent 僵死自愈(条件删除)")
     wrk_after = hosts[1]['hooks']['apply']['after']
     chk(any('systemctl enable k0s-calico-nftables' in c for c in wrk_after), "worker hook after 含 systemd enable")
+    chk(all('k0s kubectl' not in c for c in wrk_after), "worker hook 无 kubectl(worker 无权限)")
     print(f"[{label}] {'PASS' if ok else 'FAIL'}\n")
     return ok
 

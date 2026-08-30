@@ -133,7 +133,9 @@ spec:
       hooks:
         apply:
           before:
-            # 升级宿主机 ipset(Calico nftables 模式的安全网; 真正生效靠 FELIX_NFTABLESMODE)
+            # 升级宿主机 ipset(Calico iptables 模式的安全网)
+            # 注: k0s 二进制的保障在 deploy.sh 的 preflight 完成 —— k0sctl 对
+            # useExistingK0s 的校验发生在其内部 hook 之前, 不能靠 hook 补
             - apt-get update -y >/dev/null 2>&1 || true
             - apt-get install -y ipset >/dev/null 2>&1 || true
           after:
@@ -142,8 +144,17 @@ spec:
             - printf '[Service]\\nEnvironment=POD_CIDR=${K0S_POD_CIDR}\\n' > /etc/systemd/system/k0s-calico-nftables.service.d/override.conf
             - systemctl daemon-reload
             - systemctl enable k0s-calico-nftables.service
-            # 等待 Calico 起来后首次应用 nft 规则(脚本内部会等待 nft 表出现)
-            - POD_CIDR=${K0S_POD_CIDR} /usr/local/sbin/apply-nftables-rules.sh >/dev/null 2>&1 || true
+            # 清陈旧 nft 表 + INPUT/FORWARD 放行 + main 表 tailnet 路由(脚本内部等待链出现, 最多 180s)
+            - POD_CIDR=${K0S_POD_CIDR} WAIT_SECS=180 /usr/local/sbin/apply-nftables-rules.sh >/dev/null 2>&1 || true
+            # calico-node 直连 API server(绕开 Service IP 依赖, hostNetwork 组件确定性可达);
+            # 带 5 分钟重试: 等 apiserver 与 calico 资源出现(幂等, set env 已存在则更新)
+            - for i in \$(seq 1 60); do k0s kubectl set env ds -n kube-system calico-node KUBERNETES_SERVICE_HOST=${K0S_CONTROLLER_IP} KUBERNETES_SERVICE_PORT=6443 >/dev/null 2>&1 && break; sleep 5; done
+            - for i in \$(seq 1 60); do k0s kubectl set env deploy -n kube-system calico-kube-controllers KUBERNETES_SERVICE_HOST=${K0S_CONTROLLER_IP} KUBERNETES_SERVICE_PORT=6443 >/dev/null 2>&1 && break; sleep 5; done
+            # 终局收敛: 等 kube-system 全部 Ready(最多 4 分钟);
+            # 超时则删除 calico-node / konnectivity-agent 让其在健康网络下重建
+            # (agent 曾在网络未通时启动会僵死不重试), 再等 3 分钟。
+            # 注意: k0sctl 对 hook 做 os.ExpandEnv, 美元符号变量会被吃掉 — 此处禁止使用 shell 变量
+            - k0s kubectl wait pod -n kube-system --all --for=condition=Ready --timeout=240s >/dev/null 2>&1 || { sleep 5; k0s kubectl delete pod -n kube-system -l k8s-app=calico-node --ignore-not-found >/dev/null 2>&1; k0s kubectl delete pod -n kube-system -l k8s-app=konnectivity-agent --ignore-not-found >/dev/null 2>&1; k0s kubectl wait pod -n kube-system --all --for=condition=Ready --timeout=180s >/dev/null 2>&1 || true; }
 
     # --- worker ---
     - role: worker
@@ -174,7 +185,8 @@ spec:
             - printf '[Service]\\nEnvironment=POD_CIDR=${K0S_POD_CIDR}\\n' > /etc/systemd/system/k0s-calico-nftables.service.d/override.conf
             - systemctl daemon-reload
             - systemctl enable k0s-calico-nftables.service
-            - POD_CIDR=${K0S_POD_CIDR} /usr/local/sbin/apply-nftables-rules.sh >/dev/null 2>&1 || true
+            # 清陈旧 nft 表 + 放行规则 + tailnet 路由(等待 Calico 链出现, 最多 180s)
+            - POD_CIDR=${K0S_POD_CIDR} WAIT_SECS=180 /usr/local/sbin/apply-nftables-rules.sh >/dev/null 2>&1 || true
 
   k0s:
     version: ${K0S_VERSION}

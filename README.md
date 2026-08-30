@@ -28,6 +28,7 @@
 ```
 .
 ├── .env.example              # 所有可配置项(域名/IP/CIDR/存储/镜像代理),唯一需要你改的地方
+├── deploy.sh                 # 一键部署: 渲染 + preflight + apply + 自检(--reset 重装)
 ├── render.sh                 # 把 .env 渲染成真实配置(config.yaml/Caddyfile/k0sctl.yaml)
 ├── headscale/                # 自建 Tailscale 控制面
 │   ├── docker-compose.yaml   # Caddy(TLS) + Headscale(HTTP/STUN/DERP),host network
@@ -65,23 +66,29 @@
 
 ### 一键部署
 ```bash
-# 1. 填写你的真实值
+# 1. 填写你的真实值(唯一需要手动做的事)
 cp .env.example .env && vi .env
 
-# 2. 渲染配置
-./render.sh
+# 2. 部署 Headscale 控制面(见 headscale/README.md, 一次性)
 
-# 3. 部署 Headscale 控制面(见 headscale/README.md)
-cd headscale && docker compose up -d && cd ..
-
-# 4. 一条命令部署 k0s 集群(所有网络修复自动完成)
-k0sctl apply --config k0s/k0sctl.yaml
+# 3. 一条命令部署 k0s 集群(渲染 + 二进制保障 + apply + 全部修复 + 自检)
+./deploy.sh
 ```
 
-> 第 4 步只需 `k0sctl apply` 一条命令。所有 overlay-over-WireGuard 网络修复
-> (Calico VXLAN/VTEP/Felix、CRD/RBAC、nftables 放行、loadbalancer 禁用)
-> 通过 k0sctl 的 `files` 上传 + `hooks` 自动执行,无需手动跑任何脚本。
-> `k0s/scripts/apply-calico-fixes.sh` 仅在排障/补救时使用。
+重装已有集群:
+```bash
+./deploy.sh --reset    # 自动 reset + 清 kine + 重新安装 + 自检
+```
+
+> `deploy.sh` 会自动完成: 配置渲染 → k0s 二进制保障(节点已有 → 本地 cache →
+> K0S_BINARY_URL → GitHub 兜底) → k0sctl apply → 部署后自检。
+> 所有 overlay-over-WireGuard 网络修复(Calico VXLAN/VTEP、adminnetworkpolicies
+> CRD、nftables 放行、API 直连、konnectivity 自愈)由 k0sctl 的 `files` + `hooks`
+> 在 apply 过程中自动执行,并内置收敛等待与失败自愈。
+> `k0s/scripts/apply-calico-fixes.sh` 仅在排障时使用。
+>
+> ⚠️ 已知限制: k0sctl 对 hook 命令做环境变量展开, hook 内禁止使用 shell 变量
+> (`$(...)` 命令替换除外)。修改 hook 时注意。
 
 ### 验证
 ```bash
