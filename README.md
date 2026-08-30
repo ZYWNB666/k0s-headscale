@@ -44,7 +44,7 @@
 │   │   ├── 01-calico-admin-network-policies-rbac.yaml
 │   │   └── 02-calico-kube-controllers-rbac.yaml
 │   ├── scripts/
-│   │   ├── apply-calico-fixes.sh    # 部署后修复(幂等,可重复执行)
+│   │   ├── apply-calico-fixes.sh    # 排障/补救脚本(正常部署无需手动跑)
 │   │   └── apply-nftables-rules.sh  # nft 放行规则(幂等)
 │   ├── systemd/
 │   │   └── k0s-calico-nftables.service  # 开机自动重应用 nft 规则
@@ -63,7 +63,7 @@
 - 一个域名(指向控制面机器的公网 IP)+ TLS 证书
 - 部署机(controller)有到所有节点的免密 SSH
 
-### 三步部署
+### 一键部署
 ```bash
 # 1. 填写你的真实值
 cp .env.example .env && vi .env
@@ -71,14 +71,17 @@ cp .env.example .env && vi .env
 # 2. 渲染配置
 ./render.sh
 
-# 3a. 部署 Headscale 控制面(见 headscale/README.md)
-cd headscale && docker compose up -d
+# 3. 部署 Headscale 控制面(见 headscale/README.md)
+cd headscale && docker compose up -d && cd ..
 
-# 3b. 部署 k0s 集群
+# 4. 一条命令部署 k0s 集群(所有网络修复自动完成)
 k0sctl apply --config k0s/k0sctl.yaml
-# 3c. 应用 Calico 修复(幂等,reset 重装后需重跑)
-bash k0s/scripts/apply-calico-fixes.sh
 ```
+
+> 第 4 步只需 `k0sctl apply` 一条命令。所有 overlay-over-WireGuard 网络修复
+> (Calico VXLAN/VTEP/Felix、CRD/RBAC、nftables 放行、loadbalancer 禁用)
+> 通过 k0sctl 的 `files` 上传 + `hooks` 自动执行,无需手动跑任何脚本。
+> `k0s/scripts/apply-calico-fixes.sh` 仅在排障/补救时使用。
 
 ### 验证
 ```bash

@@ -49,11 +49,12 @@ def build_k0sctl(env, kine_ds='', registry=''):
     lines.append(f"  name: {env['K0S_CLUSTER_NAME']}")
     lines.append("spec:")
     lines.append("  hosts:")
+    is_controller = True
     for role, host, ip, user, port, key in [
         ('controller+worker', env['K0S_CONTROLLER_HOST'], env['K0S_CONTROLLER_IP'], env['K0S_CONTROLLER_SSH_USER'], env['K0S_CONTROLLER_SSH_PORT'], env['K0S_CONTROLLER_SSH_KEY']),
         ('worker', env['K0S_WORKER_HOST'], env['K0S_WORKER_IP'], env['K0S_WORKER_SSH_USER'], env['K0S_WORKER_SSH_PORT'], env['K0S_WORKER_SSH_KEY']),
     ]:
-        noTaints = "\n      noTaints: true" if role.startswith('controller') else ""
+        noTaints = "\n      noTaints: true" if is_controller else ""
         lines.append(f"    - role: {role}{noTaints}")
         lines.append(f"      hostname: {host}")
         lines.append("      installFlags:")
@@ -63,13 +64,35 @@ def build_k0sctl(env, kine_ds='', registry=''):
         lines.append(f"        user: {user}")
         lines.append(f"        port: {port}")
         lines.append(f"        keyPath: {key}")
+        lines.append("      files:")
+        if is_controller:
+            # controller: 上传 manifest 到 k0s 自动 apply 目录 + nft 脚本/单元
+            for mfst in ['00-adminnetworkpolicies-crd.yaml',
+                         '01-calico-admin-network-policies-rbac.yaml',
+                         '02-calico-kube-controllers-rbac.yaml']:
+                lines.append(f"        - src: manifests/{mfst}")
+                lines.append('          dstDir: /var/lib/k0s/manifests/calico-fixes')
+                lines.append('          perm: "0644"')
+        lines.append("        - src: scripts/apply-nftables-rules.sh")
+        lines.append("          dstDir: /usr/local/sbin")
+        lines.append('          perm: "0755"')
+        lines.append("        - src: systemd/k0s-calico-nftables.service")
+        lines.append("          dstDir: /etc/systemd/system")
+        lines.append('          perm: "0644"')
         lines.append("      hooks:")
         lines.append("        apply:")
         lines.append("          before:")
         lines.append("            - apt-get update -y >/dev/null 2>&1 || true")
         lines.append("            - apt-get install -y ipset >/dev/null 2>&1 || true")
         lines.append("          after:")
+        lines.append("            - mkdir -p /etc/systemd/system/k0s-calico-nftables.service.d")
+        lines.append(f"            - printf '[Service]\\\\nEnvironment=POD_CIDR={env['K0S_POD_CIDR']}\\\\n' > /etc/systemd/system/k0s-calico-nftables.service.d/override.conf")
+        lines.append("            - systemctl daemon-reload")
+        lines.append("            - systemctl enable k0s-calico-nftables.service")
         lines.append(f"            - POD_CIDR={env['K0S_POD_CIDR']} /usr/local/sbin/apply-nftables-rules.sh >/dev/null 2>&1 || true")
+        if is_controller:
+            lines.append("            - k0s kubectl set env deploy -n kube-system calico-kube-controllers ENABLED_CONTROLLERS=node,policy,profile,workloadendpoint >/dev/null 2>&1 || true")
+        is_controller = False
     lines.append("  k0s:")
     lines.append(f"    version: {env['K0S_VERSION']}")
     lines.append("    versionChannel: stable")
@@ -173,6 +196,25 @@ def check_k0sctl(env, kine_ds, registry, label):
     chk(hosts[1]['role'] == 'worker', "host1=worker")
     chk(hosts[0]['installFlags'][0].endswith(env['K0S_CONTROLLER_IP']), "controller node-ip flag")
     chk(hosts[1]['installFlags'][0].endswith(env['K0S_WORKER_IP']), "worker node-ip flag")
+    # files 字段: controller 上传 manifest + nft 脚本/单元; worker 仅 nft 脚本/单元
+    ctrl_files = hosts[0].get('files', [])
+    chk(len(ctrl_files) == 5, f"controller files 数量=5 (3 manifest + 脚本 + 单元), 实际={len(ctrl_files)}")
+    ctrl_dsts = {f.get('dstDir') for f in ctrl_files}
+    chk('/var/lib/k0s/manifests/calico-fixes' in ctrl_dsts, "controller files 含 manifest 目标目录")
+    chk('/usr/local/sbin' in ctrl_dsts, "controller files 含 nft 脚本目录")
+    chk('/etc/systemd/system' in ctrl_dsts, "controller files 含 systemd 目录")
+    wrk_files = hosts[1].get('files', [])
+    chk(len(wrk_files) == 2, f"worker files 数量=2 (脚本 + 单元), 实际={len(wrk_files)}")
+    wrk_dsts = {f.get('dstDir') for f in wrk_files}
+    chk('/var/lib/k0s/manifests' not in str(wrk_dsts), "worker 不含 manifest(只在 controller)")
+    # hooks.after: systemd 启用 + nft 首次应用 + (controller) loadbalancer 禁用
+    ctrl_after = hosts[0]['hooks']['apply']['after']
+    chk(any('systemctl enable k0s-calico-nftables' in c for c in ctrl_after), "controller hook after 含 systemd enable")
+    chk(any('apply-nftables-rules.sh' in c for c in ctrl_after), "controller hook after 含 nft 首次应用")
+    chk(any('ENABLED_CONTROLLERS' in c for c in ctrl_after), "controller hook after 含 loadbalancer 禁用")
+    wrk_after = hosts[1]['hooks']['apply']['after']
+    chk(any('systemctl enable k0s-calico-nftables' in c for c in wrk_after), "worker hook after 含 systemd enable")
+    chk(all('ENABLED_CONTROLLERS' not in c for c in wrk_after), "worker hook after 不含 loadbalancer(仅 controller)")
     print(f"[{label}] {'PASS' if ok else 'FAIL'}\n")
     return ok
 

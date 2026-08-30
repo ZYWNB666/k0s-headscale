@@ -81,8 +81,12 @@ echo ">>> 渲染 k0s/k0sctl.yaml"
 cat > k0s/k0sctl.yaml <<EOF
 # =============================================================================
 # 由 render.sh 从 .env 生成 — 含 Tailscale/Headscale 组网全部网络修复
-# 部署: k0sctl apply --config k0s/k0sctl.yaml
-# 部署后还需执行一次: k0s/scripts/apply-calico-fixes.sh (处理 k0s 无法配置的项)
+# 部署只需一条命令: k0sctl apply --config k0s/k0sctl.yaml
+#
+# 修复的持久化三层(全部由 k0sctl apply 自动完成, 无需手动跑脚本):
+#   1. 配置层(k0s.yaml): Calico VXLAN/VTEP/Felix/kube-proxy/node-ip — k0s 写入节点, 重启自愈
+#   2. 集群层(manifest): CRD/RBAC — 经 files 上传到 /var/lib/k0s/manifests/, k0s 自动 apply
+#   3. 节点层(systemd): nft 规则 — 经 files 上传脚本+单元, apply.after hook 启用, 开机自愈
 # =============================================================================
 apiVersion: k0sctl.k0sproject.io/v1beta1
 kind: Cluster
@@ -102,6 +106,25 @@ spec:
         user: ${K0S_CONTROLLER_SSH_USER}
         port: ${K0S_CONTROLLER_SSH_PORT}
         keyPath: ${K0S_CONTROLLER_SSH_KEY}
+      # 上传文件到 controller(k0sctl 在 apply 阶段自动 scp)
+      files:
+        # Calico CRD + RBAC → k0s 自动 apply(集群级持久)
+        - src: manifests/00-adminnetworkpolicies-crd.yaml
+          dstDir: /var/lib/k0s/manifests/calico-fixes
+          perm: "0644"
+        - src: manifests/01-calico-admin-network-policies-rbac.yaml
+          dstDir: /var/lib/k0s/manifests/calico-fixes
+          perm: "0644"
+        - src: manifests/02-calico-kube-controllers-rbac.yaml
+          dstDir: /var/lib/k0s/manifests/calico-fixes
+          perm: "0644"
+        # nftables 放行规则脚本 + systemd 单元(节点级持久)
+        - src: scripts/apply-nftables-rules.sh
+          dstDir: /usr/local/sbin
+          perm: "0755"
+        - src: systemd/k0s-calico-nftables.service
+          dstDir: /etc/systemd/system
+          perm: "0644"
       hooks:
         apply:
           before:
@@ -109,8 +132,16 @@ spec:
             - apt-get update -y >/dev/null 2>&1 || true
             - apt-get install -y ipset >/dev/null 2>&1 || true
           after:
-            # 部署后立即应用 nft 放行规则(节点重启由 systemd 单元重应用)
+            # 注册 nft 规则为开机自启服务(节点重启自愈)
+            - mkdir -p /etc/systemd/system/k0s-calico-nftables.service.d
+            - printf '[Service]\\nEnvironment=POD_CIDR=${K0S_POD_CIDR}\\n' > /etc/systemd/system/k0s-calico-nftables.service.d/override.conf
+            - systemctl daemon-reload
+            - systemctl enable k0s-calico-nftables.service
+            # 等待 Calico 起来后首次应用 nft 规则(脚本内部会等待 nft 表出现)
             - POD_CIDR=${K0S_POD_CIDR} /usr/local/sbin/apply-nftables-rules.sh >/dev/null 2>&1 || true
+            # 禁用 calico-kube-controllers 不兼容的 loadbalancer controller
+            # (k0s 模板 v3.32 默认启用, 镜像 v3.29.3 不支持 → FATAL)
+            - k0s kubectl set env deploy -n kube-system calico-kube-controllers ENABLED_CONTROLLERS=node,policy,profile,workloadendpoint >/dev/null 2>&1 || true
 
     # --- worker ---
     - role: worker
@@ -122,12 +153,24 @@ spec:
         user: ${K0S_WORKER_SSH_USER}
         port: ${K0S_WORKER_SSH_PORT}
         keyPath: ${K0S_WORKER_SSH_KEY}
+      files:
+        # worker 不需要 manifest(只在 controller apply), 但需要 nft 规则
+        - src: scripts/apply-nftables-rules.sh
+          dstDir: /usr/local/sbin
+          perm: "0755"
+        - src: systemd/k0s-calico-nftables.service
+          dstDir: /etc/systemd/system
+          perm: "0644"
       hooks:
         apply:
           before:
             - apt-get update -y >/dev/null 2>&1 || true
             - apt-get install -y ipset >/dev/null 2>&1 || true
           after:
+            - mkdir -p /etc/systemd/system/k0s-calico-nftables.service.d
+            - printf '[Service]\\nEnvironment=POD_CIDR=${K0S_POD_CIDR}\\n' > /etc/systemd/system/k0s-calico-nftables.service.d/override.conf
+            - systemctl daemon-reload
+            - systemctl enable k0s-calico-nftables.service
             - POD_CIDR=${K0S_POD_CIDR} /usr/local/sbin/apply-nftables-rules.sh >/dev/null 2>&1 || true
 
   k0s:
@@ -222,5 +265,6 @@ echo "   k0s/k0sctl.yaml"
 echo "============================================================"
 echo "下一步:"
 echo "  1. 部署 Headscale 控制面:  见 headscale/README.md"
-echo "  2. 部署 k0s 集群:          k0sctl apply --config k0s/k0sctl.yaml"
-echo "  3. 应用 Calico 修复:        bash k0s/scripts/apply-calico-fixes.sh"
+echo "  2. 部署 k0s 集群(一键):     k0sctl apply --config k0s/k0sctl.yaml"
+echo "     (所有网络修复由 k0sctl 自动完成, 无需手动跑脚本)"
+echo "  3. 排障(可选):              bash k0s/scripts/apply-calico-fixes.sh"

@@ -1,18 +1,19 @@
 #!/bin/bash
 # =============================================================================
-# k0s + Tailscale/Headscale 组网 — Calico 修复脚本(幂等, 可重复执行)
+# k0s + Tailscale/Headscale 组网 — Calico 排障/补救脚本(可选, 幂等)
 # =============================================================================
-# 在 k0sctl apply 完成、集群基本可用后, 在 controller 上以 root 执行一次。
-# 修复 k0s v1.36 在 overlay-over-WireGuard 环境下无法通过 k0s.yaml 配置的剩余
-# Calico 问题(CRD/RBAC 版本不匹配、kube-controllers loadbalancer 不兼容、
-# nftables 放行规则)。
+# ⚠️ 正常部署不需要手动跑本脚本!
+#    k0sctl apply 已通过 files + hooks 自动完成全部修复:
+#      - manifest CRD/RBAC → /var/lib/k0s/manifests/ (k0s 自动 apply)
+#      - loadbalancer 禁用 → apply.after hook
+#      - nft 规则 + systemd → apply.after hook
 #
-# 用法:
-#   sudo K0S_CONTROLLER_IP=100.64.0.1 K0S_WORKER_IP=100.64.0.8 \
-#        POD_CIDR=10.244.0.0/16 ./apply-calico-fixes.sh
-# 不带参数时会尝试读取仓库根的 .env。
+# 本脚本仅用于以下场景:
+#   - k0sctl apply 中途失败(hook 没跑到), 需要手动补一次
+#   - 升级/迁移后重新校准 Calico 组件
+#   - 排障时想快速重置 Calico 状态
 #
-# 幂等: 所有操作均声明式或带去重, reset 后重新 apply 集群可再次安全运行。
+# 在 controller 上以 root 执行。不带参数时会读取仓库根的 .env。
 # =============================================================================
 set -euo pipefail
 
