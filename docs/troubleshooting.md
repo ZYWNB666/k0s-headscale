@@ -53,18 +53,28 @@ k0s 在 Tailscale/Headscale overlay 上部署时遇到的 17 个问题,按现象
 - **修复**:k0sctl.yaml `calico.envVars.FELIX_NFTABLESMODE: Enabled`(用 nftables 代替 ipset);
   k0sctl hook 顺带 `apt install ipset` 升级宿主机 ipset 作安全网。
 
-### 6. calico-kube-controllers FATAL 退出
-- **现象**:calico-kube-controllers 反复重启,日志含 `loadbalancer controller` 相关 FATAL。
-- **根因**:k0s 模板(v3.32)默认启用 loadbalancer controller,但镜像(v3.29.3)不支持。
-- **定位**:`kubectl logs -n kube-system -l k8s-app=calico-kube-controllers`。
-- **修复**:apply-calico-fixes.sh `kubectl set env ... ENABLED_CONTROLLERS=node,policy,profile,workloadendpoint`。
+### 6. calico-kube-controllers FATAL 退出 / RBAC forbidden / adminnetworkpolicies 报错
+- **现象**:calico-kube-controllers 报 `Invalid controller 'loadbalancer'` FATAL,
+  或 `serviceaccounts is forbidden`,或 calico-node 报
+  `the server could not find the requested resource (get adminnetworkpolicies...)`。
+- **根因**:镜像与模板版本错配。⚠️ 这通常是**自己造成的**——在 k0sctl.yaml 的
+  `spec.images.calico` 里手动钉了旧版本/上游镜像名(如 `quay.io/calico/node:v3.29.3`),
+  而 k0s 的 chart 模板来自 v3.32.1。k0s 自带默认是配套的
+  `quay.io/k0sproject/calico-*:v3.32.1-2`(-2 后缀是 k0s 的补丁号)。
+  详见 https://github.com/k0sproject/k0s/issues/8199
+- **定位**:`kubectl get ds -n kube-system calico-node -o jsonpath='{.spec.template.spec.containers[0].image}'`
+  对照 k0s 常量 `pkg/constant/constant.go` 的 Calico*ImageVersion。
+- **修复**:**删掉 spec.images.calico 覆盖**,让 k0s 用自带版本;需要代理时只用
+  `spec.images.repository` 改写 registry host(不碰版本)。
 
-### 7. calico-kube-controllers 报 "serviceaccounts is forbidden"
-- **现象**:日志反复 `connection is unauthorized: serviceaccounts is forbidden`。
-- **根因**:k0s 模板 v3.32 的 namespace controller 需要 list serviceaccounts,但 k0s 打包的
-  ClusterRole(旧版本)缺该权限。典型版本错配。
-- **定位**:`kubectl get clusterrole calico-kube-controllers -o yaml | grep -A2 serviceaccounts`(为空即缺)。
-- **修复**:manifest `02-calico-kube-controllers-rbac.yaml` 提供完整 ClusterRole。
+### 7. calico-node 报 "adminnetworkpolicies 资源不存在"
+- **现象**:felix 日志反复 list `adminnetworkpolicies` 失败,calico-node 不 ready。
+- **根因**:k0s 自带的 `static/manifests/calico/CustomResourceDefinition/` 只有 19 个 CRD,
+  不含 `adminnetworkpolicies` / `baselineadminnetworkpolicies`(v3.32 felix 会 watch 它们)。
+  这是 k0s 打包遗漏(issue #8199),与镜像版本无关,版本对了也缺。
+- **定位**:`kubectl get crd | grep adminnetworkpolicy`(为空即缺)。
+- **修复**:manifest `00-adminnetworkpolicies-crd.yaml` + `01-calico-admin-network-policies-rbac.yaml`
+  (由 k0sctl files 上传到 /var/lib/k0s/manifests/ 自动 apply)。
 
 ### 8. calico-node 报 "adminnetworkpolicies 资源不存在 / forbidden"
 - **现象**:felix 日志反复 list `adminnetworkpolicies` 失败,calico-node 不 ready。
@@ -130,7 +140,9 @@ k0s 在 Tailscale/Headscale overlay 上部署时遇到的 17 个问题,按现象
 ### 17. quay.io / docker.io 直连拉取慢
 - **现象**:拉取 calico/coredns 等镜像很慢或失败。
 - **根因**:国内直连境外 registry 不稳定。
-- **修复**:`.env` 设 `K0S_REGISTRY_PROXY=harbor.example.com`,render.sh 自动给所有镜像加代理前缀。
+- **修复**:`.env` 设 `K0S_REGISTRY_PROXY`(如 `harbor.example.com/quay.io`),render.sh 生成
+  `spec.images.repository` —— k0s 只改写 registry 主机名,**版本仍用 k0s 自带值**。
+  ⚠️ 不要用 `spec.images.calico.*` 手动钉镜像名/版本来实现代理——那是造成问题 6 的根源。
 
 ---
 

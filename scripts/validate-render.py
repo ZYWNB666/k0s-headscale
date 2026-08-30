@@ -30,11 +30,8 @@ def load_env(path):
 def parse_env_example():
     return load_env(os.path.join(REPO, '.env.example'))
 
-def gen_image(name, img_prefix, repo, ver):
-    return f"          {name}:\n            image: {img_prefix}quay.io/{repo}\n            version: {ver}\n"
-
 def build_k0sctl(env, kine_ds='', registry=''):
-    img_prefix = (registry + '/') if registry else ''
+    # registry 参数保留兼容但不再使用 — images 块已删除, 用 k0s 自带正确版本
     # 镜像 render.sh: storage 块自带 10 空格缩进, 顶格插入(下方 storage: 为 8 空格)
     if kine_ds:
         storage = ('          type: kine\n'
@@ -66,10 +63,9 @@ def build_k0sctl(env, kine_ds='', registry=''):
         lines.append(f"        keyPath: {key}")
         lines.append("      files:")
         if is_controller:
-            # controller: 上传 manifest 到 k0s 自动 apply 目录 + nft 脚本/单元
+            # controller: 上传 adminnetworkpolicies CRD + RBAC(k0s 自带 19 CRD 缺这两个)
             for mfst in ['00-adminnetworkpolicies-crd.yaml',
-                         '01-calico-admin-network-policies-rbac.yaml',
-                         '02-calico-kube-controllers-rbac.yaml']:
+                         '01-calico-admin-network-policies-rbac.yaml']:
                 lines.append(f"        - src: manifests/{mfst}")
                 lines.append('          dstDir: /var/lib/k0s/manifests/calico-fixes')
                 lines.append('          perm: "0644"')
@@ -90,8 +86,6 @@ def build_k0sctl(env, kine_ds='', registry=''):
         lines.append("            - systemctl daemon-reload")
         lines.append("            - systemctl enable k0s-calico-nftables.service")
         lines.append(f"            - POD_CIDR={env['K0S_POD_CIDR']} /usr/local/sbin/apply-nftables-rules.sh >/dev/null 2>&1 || true")
-        if is_controller:
-            lines.append("            - k0s kubectl set env deploy -n kube-system calico-kube-controllers ENABLED_CONTROLLERS=node,policy,profile,workloadendpoint >/dev/null 2>&1 || true")
         is_controller = False
     lines.append("  k0s:")
     lines.append(f"    version: {env['K0S_VERSION']}")
@@ -131,22 +125,9 @@ def build_k0sctl(env, kine_ds='', registry=''):
     lines.append("            ipvs:")
     lines.append("              scheduler: rr")
     lines.append("              strictARP: false")
-    lines.append("        images:")
-    lines.append(gen_image('konnectivity', img_prefix, 'k0sproject/apiserver-network-proxy-agent', 'v0.36.0-k0s.0').rstrip('\n'))
-    lines.append(gen_image('metricsserver', img_prefix, 'k0sproject/metrics-server', 'v0.9.0-k0s.0').rstrip('\n'))
-    lines.append(gen_image('kubeproxy', img_prefix, 'k0sproject/kube-proxy', 'v1.36.3-1').rstrip('\n'))
-    lines.append(gen_image('coredns', img_prefix, 'k0sproject/coredns', '1.14.6-k0s.0').rstrip('\n'))
-    lines.append(gen_image('pause', img_prefix, 'k0sproject/pause', '3.10.2-0').rstrip('\n'))
-    lines.append("          calico:")
-    lines.append("            cni:")
-    lines.append(f"              image: {img_prefix}quay.io/calico/cni")
-    lines.append("              version: v3.29.3")
-    lines.append("            node:")
-    lines.append(f"              image: {img_prefix}quay.io/calico/node")
-    lines.append("              version: v3.29.3")
-    lines.append("            kubecontrollers:")
-    lines.append(f"              image: {img_prefix}quay.io/calico/kube-controllers")
-    lines.append("              version: v3.29.3")
+    if registry:
+        lines.append("        images:")
+        lines.append("          repository: " + registry)
     lines.append("        telemetry:")
     lines.append("          enabled: false")
     lines.append("  options:")
@@ -187,18 +168,22 @@ def check_k0sctl(env, kine_ds, registry, label):
     chk(ev['FELIX_DEFAULTENDPOINTTOHOSTACTION'] == 'ACCEPT', "defaultEndpointToHostAction=ACCEPT")
     chk(ev['FELIX_HEALTHENABLED'] == 'true', "healthEnabled=true")
     chk(k0s['network']['kubeProxy']['mode'] == 'ipvs', "kubeProxy.mode=ipvs")
-    prefix = (registry + '/') if registry else ''
-    chk(k0s['images']['calico']['node']['image'] == f"{prefix}quay.io/calico/node", f"calico.node.image 前缀={'有' if prefix else '无'}")
-    chk(k0s['images']['konnectivity']['image'] == f"{prefix}quay.io/k0sproject/apiserver-network-proxy-agent", "konnectivity 镜像前缀")
+    # 镜像策略: 不钉任何版本(issue #8199 的教训)。
+    # 设了代理 → 只写 repository(改写 host, 版本仍由 k0s 默认);没设 → 完全无 images 块。
+    if registry:
+        chk(k0s.get('images') == {'repository': registry}, f"images.repository={registry}")
+        chk('calico' not in (k0s.get('images') or {}), "未钉 calico 镜像版本")
+    else:
+        chk('images' not in k0s, "无 images 块(用 k0s 自带正确版本)")
     hosts = spec['hosts']
     chk(len(hosts) == 2, "2 个 host")
     chk(hosts[0]['role'] == 'controller+worker', "host0=controller+worker")
     chk(hosts[1]['role'] == 'worker', "host1=worker")
     chk(hosts[0]['installFlags'][0].endswith(env['K0S_CONTROLLER_IP']), "controller node-ip flag")
     chk(hosts[1]['installFlags'][0].endswith(env['K0S_WORKER_IP']), "worker node-ip flag")
-    # files 字段: controller 上传 manifest + nft 脚本/单元; worker 仅 nft 脚本/单元
+    # files 字段: controller 上传 2 manifest + nft 脚本/单元; worker 仅 nft 脚本/单元
     ctrl_files = hosts[0].get('files', [])
-    chk(len(ctrl_files) == 5, f"controller files 数量=5 (3 manifest + 脚本 + 单元), 实际={len(ctrl_files)}")
+    chk(len(ctrl_files) == 4, f"controller files 数量=4 (2 manifest + 脚本 + 单元), 实际={len(ctrl_files)}")
     ctrl_dsts = {f.get('dstDir') for f in ctrl_files}
     chk('/var/lib/k0s/manifests/calico-fixes' in ctrl_dsts, "controller files 含 manifest 目标目录")
     chk('/usr/local/sbin' in ctrl_dsts, "controller files 含 nft 脚本目录")
@@ -207,14 +192,13 @@ def check_k0sctl(env, kine_ds, registry, label):
     chk(len(wrk_files) == 2, f"worker files 数量=2 (脚本 + 单元), 实际={len(wrk_files)}")
     wrk_dsts = {f.get('dstDir') for f in wrk_files}
     chk('/var/lib/k0s/manifests' not in str(wrk_dsts), "worker 不含 manifest(只在 controller)")
-    # hooks.after: systemd 启用 + nft 首次应用 + (controller) loadbalancer 禁用
+    # hooks.after: systemd 启用 + nft 首次应用 (不再有 loadbalancer 禁用, v3.32.1 支持)
     ctrl_after = hosts[0]['hooks']['apply']['after']
     chk(any('systemctl enable k0s-calico-nftables' in c for c in ctrl_after), "controller hook after 含 systemd enable")
     chk(any('apply-nftables-rules.sh' in c for c in ctrl_after), "controller hook after 含 nft 首次应用")
-    chk(any('ENABLED_CONTROLLERS' in c for c in ctrl_after), "controller hook after 含 loadbalancer 禁用")
+    chk(all('ENABLED_CONTROLLERS' not in c for c in ctrl_after), "controller hook after 不含 loadbalancer 禁用(v3.32.1 支持)")
     wrk_after = hosts[1]['hooks']['apply']['after']
     chk(any('systemctl enable k0s-calico-nftables' in c for c in wrk_after), "worker hook after 含 systemd enable")
-    chk(all('ENABLED_CONTROLLERS' not in c for c in wrk_after), "worker hook after 不含 loadbalancer(仅 controller)")
     print(f"[{label}] {'PASS' if ok else 'FAIL'}\n")
     return ok
 

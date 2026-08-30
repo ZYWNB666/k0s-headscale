@@ -59,12 +59,8 @@ echo ">>> 渲染 headscale/caddy/Caddyfile"
 envsubst '$HEADSCALE_DOMAIN:$HEADSCALE_PORT' < headscale/caddy/Caddyfile.tpl > headscale/caddy/Caddyfile
 
 # ----------------------------------------------------------------------------
-# 2. k0s/k0sctl.yaml (条件逻辑: 镜像代理前缀 / 存储后端)
+# 2. k0s/k0sctl.yaml (条件逻辑: 存储后端)
 # ----------------------------------------------------------------------------
-# 镜像代理前缀: 留空 = 直连; 填值 = 所有镜像走该代理(harbor.example.com/quay.io/...)
-IMG_PREFIX=""
-[ -n "${K0S_REGISTRY_PROXY:-}" ] && IMG_PREFIX="${K0S_REGISTRY_PROXY}/"
-
 # 存储后端: 留空 = k0s 默认 etcd; 填 kine 数据源 = 外部 MySQL/Postgres
 if [ -n "${K0S_KINE_DATASOURCE:-}" ]; then
   STORAGE_BLOCK="          type: kine
@@ -74,8 +70,17 @@ else
   STORAGE_BLOCK="          type: etcd"
 fi
 
-# 拼装 images 块(用前缀变量, 留空时即为直连地址)
-gen_image() { printf '          %s:\n            image: %squay.io/%s\n            version: %s\n' "$1" "$IMG_PREFIX" "$2" "$3"; }
+# 镜像仓库代理: 只改写 registry host, 版本仍用 k0s 自带的正确版本
+# (spec.images.repository — 见 k0s images.go overrideRepository, issue #8199 的教训:
+#  不要手动钉镜像版本, 钉错会造成模板/镜像错配)
+if [ -n "${K0S_REGISTRY_PROXY:-}" ]; then
+  IMAGES_BLOCK="        images:
+          # 只改写 registry host: quay.io/xxx → <代理>/xxx, 版本保持 k0s 默认
+          # 路径式代理填 harbor.example.com/quay.io; 域名式填 quay.harbor.example.com
+          repository: ${K0S_REGISTRY_PROXY}"
+else
+  IMAGES_BLOCK="        # 不指定 images/repository — 用 k0s 自带的正确镜像版本(v3.32.1-2 等)"
+fi
 
 echo ">>> 渲染 k0s/k0sctl.yaml"
 cat > k0s/k0sctl.yaml <<EOF
@@ -108,14 +113,12 @@ spec:
         keyPath: ${K0S_CONTROLLER_SSH_KEY}
       # 上传文件到 controller(k0sctl 在 apply 阶段自动 scp)
       files:
-        # Calico CRD + RBAC → k0s 自动 apply(集群级持久)
+        # adminnetworkpolicies CRD + RBAC → k0s 自动 apply(集群级持久)
+        # (k0s 自带的 19 个 Calico CRD 缺这两个, v3.32 felix 会 watch)
         - src: manifests/00-adminnetworkpolicies-crd.yaml
           dstDir: /var/lib/k0s/manifests/calico-fixes
           perm: "0644"
         - src: manifests/01-calico-admin-network-policies-rbac.yaml
-          dstDir: /var/lib/k0s/manifests/calico-fixes
-          perm: "0644"
-        - src: manifests/02-calico-kube-controllers-rbac.yaml
           dstDir: /var/lib/k0s/manifests/calico-fixes
           perm: "0644"
         # nftables 放行规则脚本 + systemd 单元(节点级持久)
@@ -139,9 +142,6 @@ spec:
             - systemctl enable k0s-calico-nftables.service
             # 等待 Calico 起来后首次应用 nft 规则(脚本内部会等待 nft 表出现)
             - POD_CIDR=${K0S_POD_CIDR} /usr/local/sbin/apply-nftables-rules.sh >/dev/null 2>&1 || true
-            # 禁用 calico-kube-controllers 不兼容的 loadbalancer controller
-            # (k0s 模板 v3.32 默认启用, 镜像 v3.29.3 不支持 → FATAL)
-            - k0s kubectl set env deploy -n kube-system calico-kube-controllers ENABLED_CONTROLLERS=node,policy,profile,workloadendpoint >/dev/null 2>&1 || true
 
     # --- worker ---
     - role: worker
@@ -223,23 +223,7 @@ ${STORAGE_BLOCK}
               scheduler: rr
               strictARP: false
 
-        # 镜像(可选经仓库代理拉取)
-        images:
-$(gen_image konnectivity k0sproject/apiserver-network-proxy-agent v0.36.0-k0s.0)
-$(gen_image metricsserver k0sproject/metrics-server v0.9.0-k0s.0)
-$(gen_image kubeproxy k0sproject/kube-proxy v1.36.3-1)
-$(gen_image coredns k0sproject/coredns 1.14.6-k0s.0)
-$(gen_image pause k0sproject/pause 3.10.2-0)
-          calico:
-            cni:
-              image: ${IMG_PREFIX}quay.io/calico/cni
-              version: v3.29.3
-            node:
-              image: ${IMG_PREFIX}quay.io/calico/node
-              version: v3.29.3
-            kubecontrollers:
-              image: ${IMG_PREFIX}quay.io/calico/kube-controllers
-              version: v3.29.3
+${IMAGES_BLOCK}
 
         telemetry:
           enabled: false
