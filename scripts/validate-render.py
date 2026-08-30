@@ -54,6 +54,7 @@ def build_k0sctl(env, kine_ds='', registry=''):
         noTaints = "\n      noTaints: true" if is_controller else ""
         lines.append(f"    - role: {role}{noTaints}")
         lines.append(f"      hostname: {host}")
+        lines.append(f"      useExistingK0s: {env.get('K0S_USE_EXISTING_BINARY', 'false')}")
         lines.append("      installFlags:")
         lines.append(f"        - --kubelet-extra-args=--node-ip={ip}")
         lines.append("      ssh:")
@@ -115,10 +116,8 @@ def build_k0sctl(env, kine_ds='', registry=''):
     lines.append("            mode: vxlan")
     lines.append("            overlay: Always")
     lines.append(f"            ipAutodetectionMethod: interface={env['TAILSCALE_IFACE']}")
-    lines.append("            envVars:")
-    lines.append("              FELIX_NFTABLESMODE: Enabled")
-    lines.append("              FELIX_DEFAULTENDPOINTTOHOSTACTION: ACCEPT")
-    lines.append('              FELIX_HEALTHENABLED: "true"')
+    # 注意: 不生成 envVars — FELIX_NFTABLESMODE 会让 felix panic(镜像无 nft 二进制),
+    # 另两项模板已硬编码, 重复反而造成 env 冲突告警
     lines.append("          kubeProxy:")
     lines.append("            disabled: false")
     lines.append("            mode: ipvs")
@@ -163,10 +162,9 @@ def check_k0sctl(env, kine_ds, registry, label):
     chk(k0s['network']['calico']['mode'] == 'vxlan', "calico.mode=vxlan")
     chk(k0s['network']['calico']['overlay'] == 'Always', "calico.overlay=Always")
     chk(k0s['network']['calico']['ipAutodetectionMethod'] == f"interface={env['TAILSCALE_IFACE']}", "ipAutodetectionMethod=tailscale0")
-    ev = k0s['network']['calico']['envVars']
-    chk(ev['FELIX_NFTABLESMODE'] == 'Enabled', "FELIX_NFTABLESMODE=Enabled")
-    chk(ev['FELIX_DEFAULTENDPOINTTOHOSTACTION'] == 'ACCEPT', "defaultEndpointToHostAction=ACCEPT")
-    chk(ev['FELIX_HEALTHENABLED'] == 'true', "healthEnabled=true")
+    # calico.envVars 必须为空/不存在(见 build_k0sctl 内注释)
+    ev = k0s.get('network', {}).get('calico', {}).get('envVars')
+    chk(not ev, f"calico.envVars 为空(实际={ev})")
     chk(k0s['network']['kubeProxy']['mode'] == 'ipvs', "kubeProxy.mode=ipvs")
     # 镜像策略: 不钉任何版本(issue #8199 的教训)。
     # 设了代理 → 只写 repository(改写 host, 版本仍由 k0s 默认);没设 → 完全无 images 块。
@@ -181,6 +179,8 @@ def check_k0sctl(env, kine_ds, registry, label):
     chk(hosts[1]['role'] == 'worker', "host1=worker")
     chk(hosts[0]['installFlags'][0].endswith(env['K0S_CONTROLLER_IP']), "controller node-ip flag")
     chk(hosts[1]['installFlags'][0].endswith(env['K0S_WORKER_IP']), "worker node-ip flag")
+    chk(hosts[0].get('useExistingK0s') is True or hosts[0].get('useExistingK0s') is False,
+        f"useExistingK0s 布尔值={hosts[0].get('useExistingK0s')}")
     # files 字段: controller 上传 2 manifest + nft 脚本/单元; worker 仅 nft 脚本/单元
     ctrl_files = hosts[0].get('files', [])
     chk(len(ctrl_files) == 4, f"controller files 数量=4 (2 manifest + 脚本 + 单元), 实际={len(ctrl_files)}")

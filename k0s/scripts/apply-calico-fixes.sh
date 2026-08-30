@@ -59,12 +59,12 @@ echo ">>> 1/5 应用 Calico CRD + RBAC manifest..."
 $K apply -f "$MANIFESTS_DIR/" --server-side --force-conflicts 2>/dev/null \
   || $K apply -f "$MANIFESTS_DIR/"
 
-# ---- 2. calico-kube-controllers: 禁用不兼容的 loadbalancer controller ----
-#    (k0s 模板 v3.32 默认启用, 镜像 v3.29.3 不支持 → FATAL)
+# ---- 2. calico-kube-controllers: 直连 API server(跨 Tailscale 确定性可达) ----
+#    注: 旧版还需 ENABLED_CONTROLLERS 禁用 loadbalancer, 用 k0s 自带
+#    v3.32.1-2 镜像后已支持 loadbalancer, 不再需要(issue #8199)
 #    kubectl set env 是幂等的: 已存在则更新, 不存在则新增
 echo ">>> 2/5 配置 calico-kube-controllers 环境变量..."
 $K set env deploy -n kube-system calico-kube-controllers \
-  ENABLED_CONTROLLERS=node,policy,profile,workloadendpoint \
   KUBERNETES_SERVICE_HOST="$CONTROLLER_IP" \
   KUBERNETES_SERVICE_PORT=6443
 

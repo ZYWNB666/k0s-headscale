@@ -46,12 +46,29 @@ k0s 在 Tailscale/Headscale overlay 上部署时遇到的 17 个问题,按现象
 
 ## Calico 组件异常类
 
-### 5. calico-node 一直 0/1 或反复重启
-- **现象**:`kubectl get pods -n kube-system` 里 calico-node 不 Ready 或 CrashLoopBackOff。
-- **根因(可能之一)**:容器内打包的 ipset v7.11 不支持内核的 `hash:ip` revision 6,felix panic。
-- **定位**:`kubectl logs -n kube-system -l k8s-app=calico-node | grep -i panic`。
-- **修复**:k0sctl.yaml `calico.envVars.FELIX_NFTABLESMODE: Enabled`(用 nftables 代替 ipset);
-  k0sctl hook 顺带 `apt install ipset` 升级宿主机 ipset 作安全网。
+### 5. calico-node 一直 0/1:felix 内部 panic 死循环(v3.32.1-2 + FELIX_NFTABLESMODE)
+- **现象**:calico-node Running 但 0/1,restartCount=0,容器不退出;felix 日志疯狂刷屏
+  (logrotate 数分钟一次),周期性出现 `panic: (*logrus.Entry)`。
+- **根因**:给 calico-node 设了 `FELIX_NFTABLESMODE: Enabled`(v3.29.3 时代绕 ipset panic 的
+  老修复)。k0sproject/calico-node:v3.32.1-2 镜像内**没有 nft 二进制**,felix 的 knftables
+  客户端创建失败 → `table.go 411: Failed to create knftables client` → supervisor 捕获 panic
+  → 重试 → 无限循环。**v3.32.1-2 默认 iptables+ipset 模式工作正常,此修复已成为毒药**。
+- **定位**:`grep panic /var/log/pods/kube-system_calico-node-*/calico-node/0.log`,
+  panic 前一行即 Fatal 原因。
+- **修复**:删除 calico.envVars 里的 FELIX_*(本项目 render.sh 已不生成)。
+  同理 FELIX_DEFAULTENDPOINTTOHOSTACTION / FELIX_HEALTHENABLED 模板已硬编码正确值,
+  手动设置会与模板重复(env 冲突告警)。
+
+### 5b. 陈旧 nft `table ip calico` 导致全集群 pod 不通
+- **现象**:calico-node Ready、路由/FDB/VTEP 全对,但所有新连接(pod↔pod、kubelet→pod 探针)
+  100% 丢包;FORWARD 的 iptables 计数器无增长。
+- **根因**:felix 曾以 nftables 模式运行(见问题5),遗留 `table ip calico`(含挂 forward/input
+  hook 的 base chain)。切回 iptables 模式后该表未被清理,与 iptables 的 cali-* 链并行处理包,
+  其过期策略直接 DROP(实测 61803 进 163 出)。iptables 层面怎么插放行规则都无效
+  (两套 base chain 同优先级,nft 表先注册先处理)。
+- **定位**:`nft list chain ip calico filter-FORWARD` 看计数器;`nft list tables | grep calico`。
+- **修复**:`nft delete table ip calico; nft delete table ip6 calico`(两节点)。
+  apply-nftables-rules.sh 已内置此清理(幂等,开机自愈)。
 
 ### 6. calico-kube-controllers FATAL 退出 / RBAC forbidden / adminnetworkpolicies 报错
 - **现象**:calico-kube-controllers 报 `Invalid controller 'loadbalancer'` FATAL,
@@ -143,6 +160,20 @@ k0s 在 Tailscale/Headscale overlay 上部署时遇到的 17 个问题,按现象
 - **修复**:`.env` 设 `K0S_REGISTRY_PROXY`(如 `harbor.example.com/quay.io`),render.sh 生成
   `spec.images.repository` —— k0s 只改写 registry 主机名,**版本仍用 k0s 自带值**。
   ⚠️ 不要用 `spec.images.calico.*` 手动钉镜像名/版本来实现代理——那是造成问题 6 的根源。
+
+### 18. worker 节点的 konnectivity agent 连不上 server / pod 无法访问 tailnet 地址
+- **现象**:worker 上 konnectivity-agent 0/1(`no servers connected`),日志
+  `dial tcp <controller-tailscale-ip>:8132: i/o timeout`;worker 上的 pod 访问
+  100.64.0.0/10(含 kubernetes Service 的 endpoint)全部超时;但跨节点 VXLAN pod 互 ping 正常。
+- **根因**:calico 给 pod 出向包打 `0x80000` fwmark(rpf-skip),tailscale 的策略路由
+  `fwmark 0x80000 → lookup main` **优先于其 table 52**;main 表没有 tailnet 路由,
+  命中默认路由 → 包从物理网卡发出(SNAT 成物理机 IP)→ 公网无 100.64.0.0/10 路由 → 蒸发。
+  controller 节点因 100.64.0.1 是本机地址(rule 0 local 表)不受影响。
+- **定位**:worker 上 `tcpdump -i any tcp port 8132` — SYN 从物理网卡(enp1s0)而非
+  tailscale0 出去;`ip rule` 看到 tailscale 的 fwmark 规则。
+- **修复**:main 表补 tailnet 路由:`ip route replace 100.64.0.0/10 dev tailscale0 table main`。
+  之后 MASQ 自动改用 tailscale0 的地址作源,tailscale 认自家节点 IP,链路闭合。
+  apply-nftables-rules.sh 已内置(问题18 段),两节点开机自愈。
 
 ---
 

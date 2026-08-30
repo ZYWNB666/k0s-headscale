@@ -37,6 +37,7 @@ need UPSTREAM_DNS_1
 need UPSTREAM_DNS_2
 need K0S_CLUSTER_NAME
 need K0S_VERSION
+need K0S_USE_EXISTING_BINARY
 need K0S_CONTROLLER_HOST
 need K0S_CONTROLLER_IP
 need K0S_WORKER_HOST
@@ -103,6 +104,7 @@ spec:
     - role: controller+worker
       noTaints: true
       hostname: ${K0S_CONTROLLER_HOST}
+      useExistingK0s: ${K0S_USE_EXISTING_BINARY}
       installFlags:
         # 指定 Tailscale IP 作为 node-ip(跨地域组网必需, 否则 kubelet 选物理网卡 IP)
         - --kubelet-extra-args=--node-ip=${K0S_CONTROLLER_IP}
@@ -146,6 +148,7 @@ spec:
     # --- worker ---
     - role: worker
       hostname: ${K0S_WORKER_HOST}
+      useExistingK0s: ${K0S_USE_EXISTING_BINARY}
       installFlags:
         - --kubelet-extra-args=--node-ip=${K0S_WORKER_IP}
       ssh:
@@ -208,13 +211,11 @@ ${STORAGE_BLOCK}
             # 强制 Calico 用 Tailscale 网卡 IP 做 VXLAN VTEP
             # (默认自动检测会选物理网卡 IP, 跨 Tailscale 节点不可达)
             ipAutodetectionMethod: interface=${TAILSCALE_IFACE}
-            envVars:
-              # Felix 用 nftables 代替 ipset(容器内 ipset v7.11 与内核不兼容会 panic)
-              FELIX_NFTABLESMODE: Enabled
-              # 默认 DROP 会阻断 pod→host; 改 ACCEPT
-              FELIX_DEFAULTENDPOINTTOHOSTACTION: ACCEPT
-              # 开启健康端点, 否则 calico-node readiness 探针失败
-              FELIX_HEALTHENABLED: "true"
+            # 注意: 不要设置 FELIX_NFTABLESMODE=Enabled!
+            # k0sproject/calico-node 镜像内无 nft 二进制, felix 会 panic 死循环(table.go 411)。
+            # v3.32.1-2 默认 iptables+ipset 模式工作正常(容器内 ipset 已是新版,
+            # 老笔记的 ipset panic 是 v3.29.3 时代的问题)。
+            # FELIX_DEFAULTENDPOINTTOHOSTACTION/FELIX_HEALTHENABLED 模板已内置正确值, 无需设置。
           # kube-proxy 用 IPVS(iptables 模式下 Service 在 pod 内不通)
           kubeProxy:
             disabled: false
