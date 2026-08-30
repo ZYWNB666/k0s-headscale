@@ -23,6 +23,7 @@ kubeconfig.*
 headscale/config/config.yaml
 headscale/caddy/Caddyfile
 k0s/k0sctl.yaml
+k0s/manifests/calico-tailscale-route.yaml
 
 # =============================================================================
 # 系统/编辑器

@@ -64,36 +64,10 @@ def build_k0sctl(env, kine_ds='', registry=''):
         lines.append(f"        keyPath: {key}")
         lines.append("      files:")
         if is_controller:
-            # controller: 上传 adminnetworkpolicies CRD + RBAC(k0s 自带 19 CRD 缺这两个)
-            for mfst in ['00-adminnetworkpolicies-crd.yaml',
-                         '01-calico-admin-network-policies-rbac.yaml']:
-                lines.append(f"        - src: manifests/{mfst}")
-                lines.append('          dstDir: /var/lib/k0s/manifests/calico-fixes')
-                lines.append('          perm: "0644"')
-        lines.append("        - src: scripts/apply-nftables-rules.sh")
-        lines.append("          dstDir: /usr/local/sbin")
-        lines.append('          perm: "0755"')
-        lines.append("        - src: systemd/k0s-calico-nftables.service")
-        lines.append("          dstDir: /etc/systemd/system")
-        lines.append('          perm: "0644"')
-        lines.append("      hooks:")
-        lines.append("        apply:")
-        lines.append("          before:")
-        lines.append("            - apt-get update -y >/dev/null 2>&1 || true")
-        lines.append("            - apt-get install -y ipset >/dev/null 2>&1 || true")
-        lines.append("          after:")
-        lines.append("            - mkdir -p /etc/systemd/system/k0s-calico-nftables.service.d")
-        lines.append(f"            - printf '[Service]\\\\nEnvironment=POD_CIDR={env['K0S_POD_CIDR']}\\\\n' > /etc/systemd/system/k0s-calico-nftables.service.d/override.conf")
-        lines.append("            - systemctl daemon-reload")
-        lines.append("            - systemctl enable k0s-calico-nftables.service")
-        lines.append(f"            - POD_CIDR={env['K0S_POD_CIDR']} WAIT_SECS=180 /usr/local/sbin/apply-nftables-rules.sh >/dev/null 2>&1 || true")
-        if is_controller:
-            cip = env['K0S_CONTROLLER_IP']
-            lines.append(f"            - for i in $(seq 1 60); do k0s kubectl set env ds -n kube-system calico-node KUBERNETES_SERVICE_HOST={cip} KUBERNETES_SERVICE_PORT=6443 >/dev/null 2>&1 && break; sleep 5; done")
-            lines.append(f"            - for i in $(seq 1 60); do k0s kubectl set env deploy -n kube-system calico-kube-controllers KUBERNETES_SERVICE_HOST={cip} KUBERNETES_SERVICE_PORT=6443 >/dev/null 2>&1 && break; sleep 5; done")
-            lines.append("            - k0s kubectl wait pod -n kube-system --all --for=condition=Ready --timeout=240s >/dev/null 2>&1 || true")
-            lines.append("            - R=$(k0s kubectl get pods -n kube-system --no-headers 2>/dev/null | awk '{split($2,a,\"/\"); if ($2!=\"Completed\" && a[1]!=a[2]) c++} END{print c+0}'); if [ \"$R\" != \"0\" ]; then k0s kubectl delete pod -n kube-system -l k8s-app=calico-node --ignore-not-found >/dev/null 2>&1 || true; k0s kubectl delete pod -n kube-system -l k8s-app=konnectivity-agent --ignore-not-found >/dev/null 2>&1 || true; fi")
-            lines.append("            - k0s kubectl wait pod -n kube-system --all --for=condition=Ready --timeout=180s >/dev/null 2>&1 || true")
+            # controller: 仅上传 tailnet 路由修复 DaemonSet(k0s manifest 自动 apply)
+            lines.append("        - src: manifests/calico-tailscale-route.yaml")
+            lines.append('          dstDir: /var/lib/k0s/manifests/calico-tailscale')
+            lines.append('          perm: "0644"')
         is_controller = False
     lines.append("  k0s:")
     lines.append(f"    version: {env['K0S_VERSION']}")
@@ -123,8 +97,9 @@ def build_k0sctl(env, kine_ds='', registry=''):
     lines.append("            mode: vxlan")
     lines.append("            overlay: Always")
     lines.append(f"            ipAutodetectionMethod: interface={env['TAILSCALE_IFACE']}")
-    # 注意: 不生成 envVars — FELIX_NFTABLESMODE 会让 felix panic(镜像无 nft 二进制),
-    # 另两项模板已硬编码, 重复反而造成 env 冲突告警
+    lines.append("            envVars:")
+    lines.append(f"              KUBERNETES_SERVICE_HOST: {env['K0S_CONTROLLER_IP']}")
+    lines.append('              KUBERNETES_SERVICE_PORT: "6443"')
     lines.append("          kubeProxy:")
     lines.append("            disabled: false")
     lines.append("            mode: ipvs")
@@ -169,9 +144,12 @@ def check_k0sctl(env, kine_ds, registry, label):
     chk(k0s['network']['calico']['mode'] == 'vxlan', "calico.mode=vxlan")
     chk(k0s['network']['calico']['overlay'] == 'Always', "calico.overlay=Always")
     chk(k0s['network']['calico']['ipAutodetectionMethod'] == f"interface={env['TAILSCALE_IFACE']}", "ipAutodetectionMethod=tailscale0")
-    # calico.envVars 必须为空/不存在(见 build_k0sctl 内注释)
-    ev = k0s.get('network', {}).get('calico', {}).get('envVars')
-    chk(not ev, f"calico.envVars 为空(实际={ev})")
+    # calico.envVars: 仅 KUBERNETES_SERVICE_HOST/PORT(API 直连, kubelet 让位 — 见
+    # kubelet_pods.go "Append remaining service env vars" 的 present 检查)
+    ev = k0s['network']['calico'].get('envVars', {})
+    chk(ev.get('KUBERNETES_SERVICE_HOST') == env['K0S_CONTROLLER_IP'], "envVars.KUBERNETES_SERVICE_HOST=controller")
+    chk(ev.get('KUBERNETES_SERVICE_PORT') == '6443', "envVars.KUBERNETES_SERVICE_PORT=6443")
+    chk(len(ev) == 2, f"envVars 无多余项(实际={ev})")
     chk(k0s['network']['kubeProxy']['mode'] == 'ipvs', "kubeProxy.mode=ipvs")
     # 镜像策略: 不钉任何版本(issue #8199 的教训)。
     # 设了代理 → 只写 repository(改写 host, 版本仍由 k0s 默认);没设 → 完全无 images 块。
@@ -188,31 +166,16 @@ def check_k0sctl(env, kine_ds, registry, label):
     chk(hosts[1]['installFlags'][0].endswith(env['K0S_WORKER_IP']), "worker node-ip flag")
     chk(hosts[0].get('useExistingK0s') is True or hosts[0].get('useExistingK0s') is False,
         f"useExistingK0s 布尔值={hosts[0].get('useExistingK0s')}")
-    # files 字段: controller 上传 2 manifest + nft 脚本/单元; worker 仅 nft 脚本/单元
+    # files: controller 仅上传 tailnet 路由 DaemonSet manifest; worker 零上传
     ctrl_files = hosts[0].get('files', [])
-    chk(len(ctrl_files) == 4, f"controller files 数量=4 (2 manifest + 脚本 + 单元), 实际={len(ctrl_files)}")
-    ctrl_dsts = {f.get('dstDir') for f in ctrl_files}
-    chk('/var/lib/k0s/manifests/calico-fixes' in ctrl_dsts, "controller files 含 manifest 目标目录")
-    chk('/usr/local/sbin' in ctrl_dsts, "controller files 含 nft 脚本目录")
-    chk('/etc/systemd/system' in ctrl_dsts, "controller files 含 systemd 目录")
-    wrk_files = hosts[1].get('files', [])
-    chk(len(wrk_files) == 2, f"worker files 数量=2 (脚本 + 单元), 实际={len(wrk_files)}")
-    wrk_dsts = {f.get('dstDir') for f in wrk_files}
-    chk('/var/lib/k0s/manifests' not in str(wrk_dsts), "worker 不含 manifest(只在 controller)")
-    # hooks.after: systemd 启用 + nft 首次应用 + KUBERNETES_SERVICE_HOST 注入 + 收敛自愈
-    ctrl_after = hosts[0]['hooks']['apply']['after']
-    chk(any('systemctl enable k0s-calico-nftables' in c for c in ctrl_after), "controller hook after 含 systemd enable")
-    chk(any('WAIT_SECS=180' in c and 'apply-nftables-rules.sh' in c for c in ctrl_after), "controller hook after 含 nft 脚本(180s 等待)")
-    chk(all('ENABLED_CONTROLLERS' not in c for c in ctrl_after), "controller hook after 不含 loadbalancer 禁用(v3.32.1 支持)")
-    chk(any('set env ds -n kube-system calico-node KUBERNETES_SERVICE_HOST' in c and 'for i in' in c
-            for c in ctrl_after), "controller hook 含 calico-node API 直连注入(带重试)")
-    chk(any('set env deploy -n kube-system calico-kube-controllers KUBERNETES_SERVICE_HOST' in c
-            for c in ctrl_after), "controller hook 含 kube-controllers API 直连注入")
-    chk(any('--for=condition=Ready' in c for c in ctrl_after), "controller hook 含 Ready 收敛等待")
-    chk(any('delete pod' in c and 'konnectivity-agent' in c for c in ctrl_after), "controller hook 含 agent 僵死自愈(条件删除)")
-    wrk_after = hosts[1]['hooks']['apply']['after']
-    chk(any('systemctl enable k0s-calico-nftables' in c for c in wrk_after), "worker hook after 含 systemd enable")
-    chk(all('k0s kubectl' not in c for c in wrk_after), "worker hook 无 kubectl(worker 无权限)")
+    chk(len(ctrl_files) == 1, f"controller files 数量=1 (路由 DaemonSet manifest), 实际={len(ctrl_files)}")
+    if ctrl_files:
+        chk(ctrl_files[0].get('src') == 'manifests/calico-tailscale-route.yaml', "controller files=路由 manifest")
+        chk(ctrl_files[0].get('dstDir') == '/var/lib/k0s/manifests/calico-tailscale', "目标为 k0s manifest 目录")
+    chk('files' not in hosts[1] or not hosts[1]['files'], "worker 零上传")
+    # 零 hook: 全部修复走 k0s 原生机制(用户要求)
+    chk('hooks' not in hosts[0], "controller 无任何 hooks")
+    chk('hooks' not in hosts[1], "worker 无任何 hooks")
     print(f"[{label}] {'PASS' if ok else 'FAIL'}\n")
     return ok
 

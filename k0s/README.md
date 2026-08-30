@@ -9,51 +9,39 @@
 3. 每台节点已安装 k0s 二进制(`k0s version` 能跑),或允许 k0sctl 自动下载
 4. 若用外部存储(kine),数据库已建好且为空;默认 etcd 可忽略
 
-## 修复的三层持久化(全部由 k0sctl apply 自动完成)
+## 修复的持久化(零 hook, 全部由 k0s 原生机制自动完成)
 
-本仓库的修复分布在三层,确保节点重启、集群重装后都不丢:
+本仓库的修复全部走 k0s 原生机制,确保节点重启、集群重装后都不丢:
 
 | 层 | 内容 | 持久化机制 | 由谁完成 |
 |----|------|-----------|---------|
-| **配置层**(k0s.yaml) | Calico VXLAN、VTEP 用 tailscale0、Felix nftables/放行/健康、kube-proxy IPVS、node-ip、镜像代理 | k0s 写入节点,重启自愈 | k0sctl apply 自动写入 |
-| **集群层**(manifest) | adminnetworkpolicies CRD + RBAC、calico-kube-controllers 完整 RBAC | 存于 etcd/kine,永久 | k0sctl `files` 上传到 `/var/lib/k0s/manifests/`,k0s 自动 apply |
-| **节点层**(systemd) | nftables INPUT/FORWARD 放行规则 | `k0s-calico-nftables.service` 开机重应用 | k0sctl `files` 上传脚本+单元,`apply.after` hook 启用 |
-| **运行时**(kubectl) | 禁用 calico-kube-controllers loadbalancer | 环境变量 | k0sctl `apply.after` hook `kubectl set env` |
+| **配置层**(k0s.yaml) | Calico VXLAN、VTEP 用 tailscale0、calico-node API 直连(envVars)、kube-proxy IPVS、node-ip、镜像代理(repository) | k0s 写入节点,重启自愈 | k0sctl apply 自动写入 |
+| **集群层**(k0s manifest) | `calico-tailscale-route` 特权 DaemonSet: 调和 main 表 tailnet 路由(修复 calico fwmark × tailscale 策略路由的流量漏出) | k0s 自动 apply 并持续调和;节点重启后 k0s 拉起即恢复 | k0sctl `files` 上传到 `/var/lib/k0s/manifests/` |
 
-> 以上全部在 `k0sctl apply` 一条命令内自动完成,**无需手动跑任何脚本**。
+> 不需要 adminnetworkpolicies CRD/RBAC(k0sproject/calico-node v3.32.1-2 补丁版
+> felix 对缺失 CRD 优雅降级,实测验证);不需要 nftables 放行脚本;
+> 不需要 systemd 单元;不需要任何 post-apply hook。
 
-## 部署步骤
+## 部署
 
-### 1. 生成配置
-
-在仓库根目录:
+一条命令(含渲染、二进制保障、apply、自检):
 ```bash
-cp .env.example .env && vi .env      # 填节点 IP/CIDR/存储/镜像代理等
-./render.sh                          # 生成 k0s/k0sctl.yaml
+./deploy.sh              # 全新/裸节点
+./deploy.sh --reset      # 卸载旧集群(含清 kine)后全新重装
 ```
 
-### 2. 一键部署集群
+k0sctl apply 阶段自动完成:
+1. `files` 上传路由修复 manifest 到 controller 的 `/var/lib/k0s/manifests/`
+2. 安装 k0s 并按 k0s.yaml 配置 Calico VXLAN + VTEP + envVars + kube-proxy IPVS
+3. DaemonSet 由 k0s 分发到所有节点,开机自动调和 tailnet 路由
+
+## 验证
 
 ```bash
-k0sctl apply --config k0s/k0sctl.yaml
-```
-
-k0sctl 会自动完成全部工作:
-1. 在每个节点装 k0s,按 `installFlags` 设 Tailscale IP 为 node-ip
-2. `apply.before` hook 装 ipset
-3. 按 k0s.yaml 配置 Calico VXLAN + Felix envVars + kube-proxy IPVS,拉起控制面
-4. `files` 上传 manifest 到 controller 的 `/var/lib/k0s/manifests/`(k0s 自动 apply CRD/RBAC)
-5. `files` 上传 nft 脚本 + systemd 单元到所有节点
-6. `apply.after` hook:启用 nft systemd 服务、首次应用 nft 规则、禁用 loadbalancer controller
-
-### 3. 验证
-
-```bash
-k0sctl kubeconfig --config k0s/k0sctl.yaml > kubeconfig
-export KUBECONFIG=$PWD/kubeconfig
+export KUBECONFIG=$PWD/kubeconfig   # deploy.sh 已生成
 
 kubectl get nodes                       # 全部 Ready
-kubectl get pods -n kube-system         # calico-node / calico-kube-controllers Running
+kubectl get pods -n kube-system         # 含 calico-tailscale-route 双节点 Running
 
 # 跨节点 pod 通信
 kubectl run nettest --image=nginx --replicas=2
@@ -61,24 +49,12 @@ kubectl get pod -o wide                 # 两个 pod 在不同节点
 kubectl exec nettest -- ping <对端 pod IP>
 ```
 
-## 重装/重置流程
-
-```bash
-k0sctl reset --config k0s/k0sctl.yaml --force
-# 若用 kine: 清空数据库  (mysql: DROP DATABASE k0s_kine; CREATE DATABASE k0s_kine;)
-k0sctl apply --config k0s/k0sctl.yaml    # 重新一键部署,所有修复自动重做
-```
-
-> 如果 `k0sctl apply` 中途因网络等原因失败(hook 没跑到),可手动补救一次:
-> `bash k0s/scripts/apply-calico-fixes.sh`(幂等,可安全重复执行)。
-
 ## 多 worker 扩展
 
 `k0sctl.yaml` 模板默认两个节点(controller+worker 和一个 worker)。加更多 worker:
 - 在 `.env` 增加该 worker 的 IP 变量
 - 编辑 `render.sh` 的 k0sctl 生成段,复制 worker host 块并改 IP
-- `apply-calico-fixes.sh` 会自动 SSH 到 `.env` 里列出的所有 worker 安装 nft 规则
-  (设 `K0S_WORKER_IPS="ip1 ip2 ip3"` 空格分隔多 worker)
+- 路由修复 DaemonSet 自动覆盖新节点,无需额外操作
 
 ## 排查
 

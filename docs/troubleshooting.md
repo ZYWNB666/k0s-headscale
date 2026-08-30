@@ -40,7 +40,7 @@ k0s 在 Tailscale/Headscale overlay 上部署时遇到的 17 个问题,按现象
 - **现象**:重启前一切正常,重启后跨节点 pod / pod→Service 又被丢。
 - **根因**:nftables 规则只存内存,Calico 重启只重建自己的链,不重建额外的 pod 网段放行规则。
 - **定位**:`nft list ruleset | grep 10.244` 看放行规则是否还在。
-- **修复**:`k0s-calico-nftables.service` 开机自动重应用(由 apply-calico-fixes.sh 安装)。
+- **修复**:FRESH 部署无需此修复; 若从 nftables 模式时代迁移, 需一次性 `nft delete table ip calico`(详见 5b)。
 
 ---
 
@@ -68,7 +68,7 @@ k0s 在 Tailscale/Headscale overlay 上部署时遇到的 17 个问题,按现象
   (两套 base chain 同优先级,nft 表先注册先处理)。
 - **定位**:`nft list chain ip calico filter-FORWARD` 看计数器;`nft list tables | grep calico`。
 - **修复**:`nft delete table ip calico; nft delete table ip6 calico`(两节点)。
-  apply-nftables-rules.sh 已内置此清理(幂等,开机自愈)。
+  FRESH 部署不会产生该表(本仓库不设 FELIX_NFTABLESMODE); 历史环境迁移需一次性手动清理。
 
 ### 6. calico-kube-controllers FATAL 退出 / RBAC forbidden / adminnetworkpolicies 报错
 - **现象**:calico-kube-controllers 报 `Invalid controller 'loadbalancer'` FATAL,
@@ -86,19 +86,17 @@ k0s 在 Tailscale/Headscale overlay 上部署时遇到的 17 个问题,按现象
 
 ### 7. calico-node 报 "adminnetworkpolicies 资源不存在"
 - **现象**:felix 日志反复 list `adminnetworkpolicies` 失败,calico-node 不 ready。
-- **根因**:k0s 自带的 `static/manifests/calico/CustomResourceDefinition/` 只有 19 个 CRD,
-  不含 `adminnetworkpolicies` / `baselineadminnetworkpolicies`(v3.32 felix 会 watch 它们)。
-  这是 k0s 打包遗漏(issue #8199),与镜像版本无关,版本对了也缺。
-- **定位**:`kubectl get crd | grep adminnetworkpolicy`(为空即缺)。
-- **修复**:manifest `00-adminnetworkpolicies-crd.yaml` + `01-calico-admin-network-policies-rbac.yaml`
-  (由 k0sctl files 上传到 /var/lib/k0s/manifests/ 自动 apply)。
+- **根因**:k0s 自带 19 个 Calico CRD 不含 ANP 两个 CRD;**上游** calico v3.29.3 镜像的
+  felix 会无条件 watch 它们并因此卡死(即 issue #8199)。
+- **重要更正(实测)**:k0s 自带的 **k0sproject/calico-node:v3.32.1-2 补丁版 felix 对缺失
+  的 ANP CRD 优雅降级** —— 删除 ANP CRD/RBAC 后重启 calico-node,两节点 1/1 Ready
+  且日志零 ANP 错误。因此**无需补任何 CRD/RBAC manifest**(本仓库已移除)。
+- **定位**:`kubectl get crd | grep adminnetworkpolicy`;felix 日志 `grep -i adminnetworkpolic`。
+- **修复**:换用 k0s 自带 v3.32.1-2 镜像即可(别钉上游版本, 见问题 6)。
 
 ### 8. calico-node 报 "adminnetworkpolicies 资源不存在 / forbidden"
-- **现象**:felix 日志反复 list `adminnetworkpolicies` 失败,calico-node 不 ready。
-- **根因**:k0s v1.36 的 calico_init/ CRD 目录缺这两个 CRD(只有 19 个旧 CRD),
-  但 v3.32 模板的 felix 会 watch 它们。
-- **定位**:`kubectl get crd | grep adminnetworkpolicy`(为空即缺)。
-- **修复**:manifest `00-adminnetworkpolicies-crd.yaml` + `01-...-rbac.yaml`。
+- 同问题 7(历史条目合并)。结论: k0sproject 补丁版镜像(v3.32.1-2)不需要 ANP CRD;
+  上游镜像(v3.29.3)需要 —— 根本解法仍是别钉上游版本。
 
 ---
 
@@ -173,7 +171,8 @@ k0s 在 Tailscale/Headscale overlay 上部署时遇到的 17 个问题,按现象
   tailscale0 出去;`ip rule` 看到 tailscale 的 fwmark 规则。
 - **修复**:main 表补 tailnet 路由:`ip route replace 100.64.0.0/10 dev tailscale0 table main`。
   之后 MASQ 自动改用 tailscale0 的地址作源,tailscale 认自家节点 IP,链路闭合。
-  apply-nftables-rules.sh 已内置(问题18 段),两节点开机自愈。
+  本仓库以 k0s manifest(`calico-tailscale-route` 特权 DaemonSet)自动调和此路由,
+  每 30s 幂等重写一次, 节点重启后 k0s 拉起即恢复 —— 无需 systemd/脚本。
 
 ---
 

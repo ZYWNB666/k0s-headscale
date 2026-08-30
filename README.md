@@ -29,7 +29,7 @@
 .
 ├── .env.example              # 所有可配置项(域名/IP/CIDR/存储/镜像代理),唯一需要你改的地方
 ├── deploy.sh                 # 一键部署: 渲染 + preflight + apply + 自检(--reset 重装)
-├── render.sh                 # 把 .env 渲染成真实配置(config.yaml/Caddyfile/k0sctl.yaml)
+├── render.sh                 # 把 .env 渲染成真实配置(config.yaml/Caddyfile/k0sctl.yaml/manifest)
 ├── headscale/                # 自建 Tailscale 控制面
 │   ├── docker-compose.yaml   # Caddy(TLS) + Headscale(HTTP/STUN/DERP),host network
 │   ├── config/
@@ -38,22 +38,17 @@
 │   │   └── acl-detailed.hujson
 │   ├── caddy/Caddyfile.tpl   # Caddy 反代模板(单端口分流 /web 和 /api)
 │   └── README.md             # 控制面部署步骤
-├── k0s/                      # k0s 集群
+├── k0s/                      # k0s 集群(零 hook, 全部走 k0s 原生机制)
 │   ├── k0sctl.yaml           # 由 render.sh 生成(已 gitignore)
-│   ├── manifests/            # Calico CRD/RBAC 补丁(集群级持久)
-│   │   ├── 00-adminnetworkpolicies-crd.yaml
-│   │   ├── 01-calico-admin-network-policies-rbac.yaml
-│   │   └── 02-calico-kube-controllers-rbac.yaml
-│   ├── scripts/
-│   │   ├── apply-calico-fixes.sh    # 排障/补救脚本(正常部署无需手动跑)
-│   │   └── apply-nftables-rules.sh  # nft 放行规则(幂等)
-│   ├── systemd/
-│   │   └── k0s-calico-nftables.service  # 开机自动重应用 nft 规则
-│   └── README.md             # 集群部署步骤
+│   └── manifests/
+│       └── calico-tailscale-route.yaml.tpl
+│                             # 特权 DaemonSet: main 表 tailnet 路由调和(修复
+│                             # calico fwmark × tailscale 策略路由的流量漏出),
+│                             # k0s 自动 apply, 节点重启自愈; 渲染产物已 gitignore
 ├── scripts/
 │   └── validate-render.py    # 校验渲染逻辑与 YAML 合法性
 └── docs/
-    └── troubleshooting.md    # 17 个问题的根因与排查
+    └── troubleshooting.md    # 全部问题的根因与排查
 ```
 
 ## 快速开始
@@ -82,13 +77,17 @@ cp .env.example .env && vi .env
 
 > `deploy.sh` 会自动完成: 配置渲染 → k0s 二进制保障(节点已有 → 本地 cache →
 > K0S_BINARY_URL → GitHub 兜底) → k0sctl apply → 部署后自检。
-> 所有 overlay-over-WireGuard 网络修复(Calico VXLAN/VTEP、adminnetworkpolicies
-> CRD、nftables 放行、API 直连、konnectivity 自愈)由 k0sctl 的 `files` + `hooks`
-> 在 apply 过程中自动执行,并内置收敛等待与失败自愈。
-> `k0s/scripts/apply-calico-fixes.sh` 仅在排障时使用。
 >
-> ⚠️ 已知限制: k0sctl 对 hook 命令做环境变量展开, hook 内禁止使用 shell 变量
-> (`$(...)` 命令替换除外)。修改 hook 时注意。
+> **apply 过程零 hook、零手动脚本** —— 全部修复走 k0s 原生机制:
+> - 配置层(`spec.network.calico`): VXLAN(穿越 WireGuard)、`ipAutodetectionMethod`
+>   (VTEP 绑 Tailscale 网卡)、`envVars`(calico-node 直连 API server, kubelet 让位)
+> - 集群层(k0s manifest): `calico-tailscale-route` 特权 DaemonSet 调和 main 表
+>   tailnet 路由(修复 calico fwmark × tailscale 策略路由的流量漏出), 节点重启自愈
+> - 镜像层(`spec.images.repository`): 只改写 registry host, 版本保持 k0s 自带
+>   (k0sproject/calico-node:v3.32.1-2 无需 adminnetworkpolicies CRD — 实测)
+>
+> ⚠️ 已知限制: k0sctl 对 hook 命令做环境变量展开(os.ExpandEnv)。本仓库不使用
+> hooks;若自行添加, 注意 `$var` 会被吞掉(`$(...)` 命令替换不受影响)。
 
 ### 验证
 ```bash

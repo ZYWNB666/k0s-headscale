@@ -128,7 +128,8 @@ kubectl get nodes
 N_NOTREADY=$(kubectl get nodes --no-headers | awk '$2!="Ready"{c++} END{print c+0}')
 [ "$N_NOTREADY" = "0" ] || { echo "!! 有节点未 Ready"; FAIL=1; }
 
-echo "--- kube-system pods ---"
+echo "--- kube-system pods(等待全部 Ready, 最多 5 分钟) ---"
+kubectl wait pod -n kube-system --all --for=condition=Ready --timeout=300s >/dev/null 2>&1 || true
 kubectl get pods -n kube-system
 N_NOTREADY=$(kubectl get pods -n kube-system --no-headers | awk '{split($2,a,"/"); if ($2!="Completed" && a[1]!=a[2]) c++} END{print c+0}')
 [ "$N_NOTREADY" = "0" ] || { echo "!! 有 pod 未 Ready"; FAIL=1; }
